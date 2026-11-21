@@ -26,6 +26,13 @@ std::string narrow(const char* s) {
         } else if (c < 0x800) {
             out.push_back(static_cast<char>(0xc0 | (c >> 6)));
             out.push_back(static_cast<char>(0x80 | (c & 0x3f)));
+        } else if (c >= 0x10000 && c <= 0x10FFFF) {
+            // Only reachable where wchar_t is UTF-32 (Linux): a supplementary
+            // code point is one wchar_t and needs four UTF-8 bytes.
+            out.push_back(static_cast<char>(0xf0 | (c >> 18)));
+            out.push_back(static_cast<char>(0x80 | ((c >> 12) & 0x3f)));
+            out.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3f)));
+            out.push_back(static_cast<char>(0x80 | (c & 0x3f)));
         } else {
             out.push_back(static_cast<char>(0xe0 | (c >> 12)));
             out.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3f)));

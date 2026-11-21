@@ -300,6 +300,17 @@ powershell -ExecutionPolicy Bypass -File scripts\stage-portable.ps1 -BuildDir bu
 Nothing is installed or pinned; `scripts\create-start-menu-shortcut.ps1` makes a Start Menu
 shortcut you can pin. The [Windows app guide](docs/WINDOWS-APP.md) covers the controller in depth.
 
+### Linux (port in progress)
+
+A Linux port is under way on the `linux-port` branch. So far it builds the portable core: the IMU
+tools, the calibration tool and the offline test suites. There is no Linux workspace yet. Plan,
+status and the Windows-to-Linux map are in [docs/linux/PORTING.md](docs/linux/PORTING.md).
+
+```bash
+sudo scripts/linux/setup-dev.sh      # Ubuntu/Debian packages + udev rule for the glasses
+cmake --preset linux-gcc && cmake --build --preset linux-gcc && ctest --preset linux-gcc
+```
+
 ## Tests
 
 Eleven CTest suites run offline, without the glasses:

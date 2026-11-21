@@ -45,7 +45,7 @@ Mat3 multiply(const Mat3& a, const Mat3& b) {
     return r;
 }
 
-Vec3 body_to_earth(const Mat3& r, const Vec3& v) {
+[[maybe_unused]] Vec3 body_to_earth(const Mat3& r, const Vec3& v) {
     return Vec3{r.m[0][0] * v.x + r.m[0][1] * v.y + r.m[0][2] * v.z,
                 r.m[1][0] * v.x + r.m[1][1] * v.y + r.m[1][2] * v.z,
                 r.m[2][0] * v.x + r.m[2][1] * v.y + r.m[2][2] * v.z};

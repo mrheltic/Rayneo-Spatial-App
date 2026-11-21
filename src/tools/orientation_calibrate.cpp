@@ -5,7 +5,14 @@
 #include "util/utf8_path.h"
 
 #include <hidapi.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <cerrno>
+#include <csignal>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -33,6 +40,26 @@ std::atomic<bool> g_cancel{false};
 // Set by an empty line on a piped stdin in --auto mode: skip the countdown.
 std::atomic<bool> g_start_now{false};
 
+// Splits the watcher's bytes into lines and applies each stdin command.
+void consume_stdin_bytes(std::string& pending, const char* bytes, size_t count) {
+    pending.append(bytes, count);
+    size_t newline = 0;
+    while ((newline = pending.find('\n')) != std::string::npos) {
+        const gt::CalibrationStdinCommand command =
+            gt::parse_calibration_stdin_line(pending.substr(0, newline));
+        pending.erase(0, newline + 1);
+        if (command == gt::CalibrationStdinCommand::Cancel) {
+            g_cancel.store(true);
+        } else if (command == gt::CalibrationStdinCommand::StartNow) {
+            g_start_now.store(true);
+        }
+    }
+    if (pending.size() > 4096) {
+        pending.clear();
+    }
+}
+
+#ifdef _WIN32
 // --auto with a piped stdin (the in-app wizard): a detached watcher reads
 // lines with ReadFile (no CRT stream lock held at exit) and turns "q" or the
 // pipe closing into the normal cancel path, so the stream-off guard runs
@@ -51,25 +78,37 @@ void start_stdin_watcher() {
                 g_cancel.store(true);  // the front end closed stdin or went away
                 return;
             }
-            pending.append(buffer, read);
-            size_t newline = 0;
-            while ((newline = pending.find('\n')) != std::string::npos) {
-                const gt::CalibrationStdinCommand command =
-                    gt::parse_calibration_stdin_line(pending.substr(0, newline));
-                pending.erase(0, newline + 1);
-                if (command == gt::CalibrationStdinCommand::Cancel) {
-                    g_cancel.store(true);
-                } else if (command == gt::CalibrationStdinCommand::StartNow) {
-                    g_start_now.store(true);
-                }
-            }
-            if (pending.size() > 4096) {
-                pending.clear();
-            }
+            consume_stdin_bytes(pending, buffer, read);
         }
     }).detach();
 }
+#else
+// POSIX twin of the watcher above: same contract, read(2) on a pipe or FIFO
+// stdin. A terminal stdin is left alone: Ctrl+C (SIGINT) works there.
+void start_stdin_watcher() {
+    struct stat info {};
+    if (fstat(STDIN_FILENO, &info) != 0 || !S_ISFIFO(info.st_mode)) {
+        return;
+    }
+    std::thread([]() {
+        std::string pending;
+        char buffer[256];
+        for (;;) {
+            const ssize_t read_count = read(STDIN_FILENO, buffer, sizeof(buffer));
+            if (read_count < 0 && errno == EINTR) {
+                continue;  // a signal landed on this thread; the handler already cancelled
+            }
+            if (read_count <= 0) {
+                g_cancel.store(true);  // the front end closed stdin or went away
+                return;
+            }
+            consume_stdin_bytes(pending, buffer, static_cast<size_t>(read_count));
+        }
+    }).detach();
+}
+#endif
 
+#ifdef _WIN32
 // Manual-reset event set when wmain has unwound past the stream-off guard
 // (on every exit path), so the console-close handler can wait for it.
 HANDLE g_cleanup_done = nullptr;
@@ -104,6 +143,34 @@ struct CleanupDoneSignal {
         }
     }
 };
+
+void install_cancel_handlers() {
+    g_cleanup_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    SetConsoleCtrlHandler(console_handler, TRUE);
+}
+#else
+// SIGINT (Ctrl+C), SIGTERM (a front end stopping the tool) and SIGHUP (the
+// terminal closing) all take the normal cancel path. Unlike a Windows console
+// close, the process keeps running after the handler returns, so the main
+// thread's stream-off guard runs without any wait here. No SA_RESTART: a
+// blocking prompt read returns EINTR and the prompt reports the cancel.
+extern "C" void cancel_signal_handler(int) {
+    g_cancel.store(true);  // lock-free atomic store: async-signal-safe
+}
+
+struct [[maybe_unused]] CleanupDoneSignal {};  // nothing to signal: see above
+
+void install_cancel_handlers() {
+    static_assert(std::atomic<bool>::is_always_lock_free);
+    struct sigaction action {};
+    action.sa_handler = cancel_signal_handler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    sigaction(SIGINT, &action, nullptr);
+    sigaction(SIGTERM, &action, nullptr);
+    sigaction(SIGHUP, &action, nullptr);
+}
+#endif
 
 struct Options {
     std::string output_path;
@@ -327,6 +394,7 @@ bool parse_args(int argc, char** argv, Options& options) {
 // directory is found, so nested build directories keep working. Falls back to
 // the historical "two levels below the root" assumption if no marker is found.
 std::string default_output_path() {
+#ifdef _WIN32
     std::wstring executable(32768, L'\0');
     const DWORD length = GetModuleFileNameW(nullptr, executable.data(),
                                             static_cast<DWORD>(executable.size()));
@@ -334,6 +402,13 @@ std::string default_output_path() {
         return "config/orientation.json";
     }
     executable.resize(length);
+#else
+    std::error_code link_error;
+    const std::filesystem::path executable = std::filesystem::read_symlink("/proc/self/exe", link_error);
+    if (link_error || executable.empty()) {
+        return "config/orientation.json";
+    }
+#endif
     const std::filesystem::path executable_directory =
         std::filesystem::path(executable).parent_path();
     for (std::filesystem::path candidate = executable_directory;; candidate = candidate.parent_path()) {
@@ -662,6 +737,10 @@ std::string system_error_utf8(const std::error_code& error) {
     if (error.category() != std::system_category()) {
         return error.message();  // CRT errno text: plain ASCII
     }
+#ifndef _WIN32
+    // POSIX: the system category is errno; strerror text in the C locale is ASCII.
+    return error.message() + " (errno " + std::to_string(error.value()) + ")";
+#else
     wchar_t* buffer = nullptr;
     const DWORD length = FormatMessageW(
         FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr,
@@ -676,6 +755,7 @@ std::string system_error_utf8(const std::error_code& error) {
     const std::string utf8 = gt::utf8_from_wide_text(text);
     const std::string code = "Windows error " + std::to_string(error.value());
     return utf8.empty() ? code : utf8 + " (" + code + ")";
+#endif
 }
 
 // Which motion would pin down the weakest hard-iron direction, in head terms.
@@ -979,8 +1059,16 @@ int calibrate_orientation_flow(gt::GtHidDevice& device, const Options& options, 
     return 0;
 }
 
+int calibrate_main(int argc, char** argv);
+
 }  // namespace
 
+#ifndef _WIN32
+// POSIX argv is already the UTF-8 bytes the caller passed.
+int main(int argc, char** argv) {
+    return calibrate_main(argc, argv);
+}
+#else
 int wmain(int argc, wchar_t** wide_argv) {
     // Wide entry point, as in spatial_desk: the controller passes UTF-8 paths
     // through a wide command line, and a narrow argv would decode them with
@@ -1005,17 +1093,22 @@ int wmain(int argc, wchar_t** wide_argv) {
         argv.push_back(argument.data());
     }
     argv.push_back(nullptr);
+    return calibrate_main(argc, argv.data());
+}
+#endif
 
+namespace {
+
+int calibrate_main(int argc, char** argv) {
     Options options;
-    if (!parse_args(argc, argv.data(), options)) {
+    if (!parse_args(argc, argv, options)) {
         return 2;
     }
     if (options.output_path.empty()) {
         options.output_path = default_output_path();
     }
-    g_cleanup_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    install_cancel_handlers();
     CleanupDoneSignal cleanup_done;  // before every device guard: destroyed after them
-    SetConsoleCtrlHandler(console_handler, TRUE);
     if (options.auto_advance) {
         start_stdin_watcher();
     }
@@ -1075,3 +1168,5 @@ int wmain(int argc, wchar_t** wide_argv) {
     }
     return calibrate_orientation_flow(device, options, csv);
 }
+
+}  // namespace

@@ -506,6 +506,29 @@ reports with all numbers and rejected ideas: `docs/overnight/track-a.md` (estima
   trail on a quick turn), calibration cancel turning the stream off, the 5 s auto delay, the
   compass badge.
 
+## 11. Linux port (branch `linux-port`, started 2026-11-21)
+
+Plan, status and the Windows -> Linux map: `docs/linux/PORTING.md`. Rules on top of everything
+above:
+
+- **Windows stays byte-identical.** Shared files only gain `#ifdef _WIN32` / `#else` branches;
+  Windows targets live in the `if(WIN32)` block of `CMakeLists.txt`. Linux code goes in new
+  folders (`src/platform/linux/`, `src/app_linux/`). Do not move existing files: upstream merges
+  (`git fetch upstream && git merge upstream/main`) must stay cheap.
+- **Build:** `cmake --preset linux-gcc` / `linux-clang` (private dirs `build/linux-*`; an agent
+  building alongside others still uses its own `-B build/agent-X`). `-Wall -Wextra -Wpedantic` is the
+  `/W4` counterpart: no new warnings under either compiler.
+- **Dependencies:** distribution packages via `scripts/linux/setup-dev.sh` (needs sudo: the user
+  runs it). DirectXMath is fetched at a pinned commit on non-Windows; `third_party/sal/sal.h` stubs
+  the SAL annotations it includes. A DirectXMath bump that uses a new annotation fails to compile:
+  add it to the stub.
+- **The IMU numbers are not a contract on Linux yet** (section 7: scenario 10 is FP-chaotic across
+  compilers). Record gcc/clang results in `docs/linux/BASELINE.md`; investigate any failing
+  assertion, never loosen it to make Linux pass.
+- **Glasses access:** `packaging/linux/udev/70-rayneo-gt.rules` (hidraw, 3941:AF50, uaccess +
+  plugdev). Without it hidapi enumerates nothing for a normal user, which looks exactly like
+  "glasses not connected".
+
 ## 8. Definition of done for any change
 
 1. Builds clean under `/W4 /permissive-` (no new warnings).

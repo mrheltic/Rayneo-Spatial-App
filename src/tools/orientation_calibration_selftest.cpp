@@ -10,7 +10,12 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#ifdef _WIN32
 #include <process.h>
+#else
+#include <unistd.h>
+#define _getpid getpid  // per-process temp names (bug 29)
+#endif
 #include <string>
 #include <vector>
 
@@ -18,7 +23,12 @@ namespace {
 
 // Defined at the end of this file, after <windows.h>, whose macros (small,
 // far, ...) would otherwise clash with names used by the tests.
-bool run_calibration_tool(const std::wstring& argument, std::string& output, unsigned long& exit_code);
+#ifdef _WIN32
+using ToolArgument = std::wstring;
+#else
+using ToolArgument = std::string;  // POSIX argv: raw UTF-8 bytes
+#endif
+bool run_calibration_tool(const ToolArgument& argument, std::string& output, unsigned long& exit_code);
 
 using gt::CalibrationPhase;
 using gt::CalibrationPhaseData;
@@ -1066,7 +1076,11 @@ int main() {
         // message, before any device access).
         std::string output;
         unsigned long exit_code = 0;
+#ifdef _WIN32
         const bool ran = run_calibration_tool(L"--r6b-probe-日ł", output, exit_code);
+#else
+        const bool ran = run_calibration_tool("--r6b-probe-\xE6\x97\xA5\xC5\x82", output, exit_code);
+#endif
         const bool exact = output.find("--r6b-probe-\xE6\x97\xA5\xC5\x82") != std::string::npos;
         if (ran && !exact) {
             std::printf("    tool printed: %s\n", output.substr(0, 120).c_str());
@@ -1080,6 +1094,7 @@ int main() {
     return failures == 0 ? 0 : 1;
 }
 
+#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -1094,7 +1109,7 @@ namespace {
 // and collects its stdout. Only ever called with an unknown option: the tool
 // rejects it in parse_args and exits 2 before hidapi or the glasses are
 // touched, echoing the option as it decoded it.
-bool run_calibration_tool(const std::wstring& argument, std::string& output, unsigned long& exit_code) {
+bool run_calibration_tool(const ToolArgument& argument, std::string& output, unsigned long& exit_code) {
     output.clear();
     exit_code = 0;
     std::wstring self(32768, L'\0');
@@ -1150,3 +1165,92 @@ bool run_calibration_tool(const std::wstring& argument, std::string& output, uns
 }
 
 }  // namespace
+#else  // POSIX
+
+#include <cerrno>
+#include <csignal>
+#include <chrono>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <thread>
+#include <unistd.h>
+
+namespace {
+
+// POSIX twin of the runner above: same contract (one argument, stdout and
+// stderr collected, 10 s limit), fork + execv with the argument passed as
+// its exact bytes.
+bool run_calibration_tool(const ToolArgument& argument, std::string& output, unsigned long& exit_code) {
+    output.clear();
+    exit_code = 0;
+    std::error_code link_error;
+    const std::filesystem::path self = std::filesystem::read_symlink("/proc/self/exe", link_error);
+    if (link_error || self.empty()) {
+        return false;
+    }
+    const std::filesystem::path tool = self.parent_path() / "orientation_calibrate";
+    std::error_code exists_error;
+    if (!std::filesystem::exists(tool, exists_error)) {
+        std::printf("    orientation_calibrate not found beside this test (build all targets)\n");
+        return false;
+    }
+    int pipe_ends[2] = {-1, -1};
+    if (pipe(pipe_ends) != 0) {
+        return false;
+    }
+    const std::string tool_path = tool.string();
+    const pid_t child = fork();
+    if (child < 0) {
+        close(pipe_ends[0]);
+        close(pipe_ends[1]);
+        return false;
+    }
+    if (child == 0) {
+        dup2(pipe_ends[1], STDOUT_FILENO);
+        dup2(pipe_ends[1], STDERR_FILENO);
+        const int null_input = open("/dev/null", O_RDONLY);
+        if (null_input >= 0) {
+            dup2(null_input, STDIN_FILENO);
+        }
+        close(pipe_ends[0]);
+        close(pipe_ends[1]);
+        char* const child_argv[] = {const_cast<char*>(tool_path.c_str()), const_cast<char*>(argument.c_str()),
+                                    nullptr};
+        execv(tool_path.c_str(), child_argv);
+        _exit(127);
+    }
+    close(pipe_ends[1]);
+    char buffer[512];
+    for (;;) {
+        const ssize_t read_count = read(pipe_ends[0], buffer, sizeof(buffer));
+        if (read_count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (read_count <= 0) {
+            break;
+        }
+        output.append(buffer, static_cast<size_t>(read_count));
+    }
+    close(pipe_ends[0]);
+    int status = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    bool exited = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const pid_t done = waitpid(child, &status, WNOHANG);
+        if (done == child) {
+            exited = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!exited) {
+        kill(child, SIGKILL);
+        waitpid(child, &status, 0);
+        return false;
+    }
+    exit_code = WIFEXITED(status) ? static_cast<unsigned long>(WEXITSTATUS(status)) : 1ul;
+    return true;
+}
+
+}  // namespace
+#endif

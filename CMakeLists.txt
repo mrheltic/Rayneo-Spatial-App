@@ -9,36 +9,67 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(MSVC)
   add_compile_options(/W4 /permissive- /utf-8 /Zc:preprocessor)
+else()
+  # The GCC/Clang counterpart of /W4: the definition of done ("no new
+  # warnings") applies to the Linux build too.
+  add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
 if(WIN32)
   add_compile_definitions(UNICODE _UNICODE)
 endif()
 
-find_package(hidapi CONFIG REQUIRED)
+# ---------------------------------------------------------------------------
+# Third-party dependencies
+#
+# Windows: vcpkg (vcpkg.json), DirectXMath from the Windows SDK.
+# Linux:   distribution packages (see docs/linux/PORTING.md) plus DirectXMath
+#          fetched at a pinned commit; it is header-only and the only SDK
+#          piece the portable camera maths needs.
+# ---------------------------------------------------------------------------
+if(WIN32)
+  find_package(hidapi CONFIG REQUIRED)
+else()
+  find_package(PkgConfig REQUIRED)
+  # hidraw backend: the GT's IMU is a vendor HID interface (usage page 0xFF00),
+  # and hidraw reports usage page / usage, which device selection relies on.
+  pkg_check_modules(HIDAPI REQUIRED IMPORTED_TARGET GLOBAL hidapi-hidraw)
+  add_library(hidapi::hidapi ALIAS PkgConfig::HIDAPI)
+endif()
 find_package(nlohmann_json CONFIG REQUIRED)
 
+add_library(rayneo_directxmath INTERFACE)
+if(NOT WIN32)
+  include(FetchContent)
+  if(POLICY CMP0169)
+    cmake_policy(SET CMP0169 OLD)  # single-argument FetchContent_Populate (headers only)
+  endif()
+  # Tag may2026. Pinned by commit so a moved tag cannot change the camera maths.
+  FetchContent_Declare(directxmath
+    GIT_REPOSITORY https://github.com/microsoft/DirectXMath.git
+    GIT_TAG 5618277fa077ab65c60bb677c0275bbccd95914d
+    GIT_SHALLOW FALSE
+  )
+  FetchContent_GetProperties(directxmath)
+  if(NOT directxmath_POPULATED)
+    FetchContent_Populate(directxmath)  # headers only: its own CMake project is not needed
+  endif()
+  target_include_directories(rayneo_directxmath SYSTEM INTERFACE
+    "${directxmath_SOURCE_DIR}/Inc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sal"
+  )
+endif()
+
+# ---------------------------------------------------------------------------
+# Portable core: IMU protocol, fusion, estimator, calibration, layout, camera
+# maths and their tools and test suites. Builds on Windows and Linux.
+# ---------------------------------------------------------------------------
 add_library(rayneo_layout STATIC
   src/layout/layout.cpp
   src/render/screen_geometry.cpp
 )
 target_include_directories(rayneo_layout PUBLIC src)
 target_link_libraries(rayneo_layout PUBLIC nlohmann_json::nlohmann_json)
-
-add_library(rayneo_vdd STATIC
-  src/vdd/display_config.cpp
-  src/vdd/display_scale.cpp
-  src/vdd/vdd_client.cpp
-  src/vdd/workspace_reload.cpp
-)
-target_include_directories(rayneo_vdd PUBLIC src)
-target_link_libraries(rayneo_vdd PUBLIC setupapi cfgmgr32)
-
-add_library(rayneo_capture STATIC
-  src/capture/desktop_duplication.cpp
-)
-target_include_directories(rayneo_capture PUBLIC src)
-target_link_libraries(rayneo_capture PUBLIC d3d11 dxgi)
 
 add_library(rayneo_core STATIC
   src/imu/gt_protocol.cpp
@@ -59,98 +90,11 @@ target_link_libraries(imu_replay PRIVATE rayneo_core)
 add_executable(gt_imu_probe src/tools/gt_imu_probe.cpp)
 target_link_libraries(gt_imu_probe PRIVATE rayneo_core)
 
-add_executable(spatial_desk
-  src/app/spatial_desk.cpp
-  src/app/engine_protocol.cpp
-  src/app/view_comfort.cpp
-  src/imu/imu_source.cpp
-  src/render/camera.cpp
-  src/render/renderer.cpp
-)
-target_link_libraries(spatial_desk PRIVATE rayneo_core rayneo_layout rayneo_vdd rayneo_capture d3d11 dxgi d3dcompiler user32 gdi32)
-
-# Controller application model: no windows, covered by app_selftest.
-# It owns the preference file, the layout editing rules, the engine command
-# contract, the telemetry tail reader and the per-session log archive.
-add_library(rayneo_app_model STATIC
-  src/app/engine_protocol.cpp
-  src/app/view_comfort.cpp
-  src/app_shell/app_config.cpp
-  src/app_shell/app_layout.cpp
-  src/app_shell/calibration_progress.cpp
-  src/app_shell/calibration_guide.cpp
-  src/app_shell/engine_commands.cpp
-  src/app_shell/onboarding.cpp
-  src/app_shell/session_logs.cpp
-  src/app_shell/telemetry.cpp
-  src/app_shell/ui_anim.cpp
-  src/app_shell/ui_model.cpp
-)
-target_include_directories(rayneo_app_model PUBLIC src)
-target_link_libraries(rayneo_app_model PUBLIC nlohmann_json::nlohmann_json rayneo_layout)
-
-# Controller shell: Win32 window, tray lifecycle, engine process owner and the
-# read-only health checks. Inbox Windows libraries only.
-add_library(rayneo_app_ui STATIC
-  src/app_shell/app_state.cpp
-  src/app_shell/app_window.cpp
-  src/app_shell/calibration_runner.cpp
-  src/app_shell/cal_guide_window.cpp
-  src/app_shell/ui_cal_guide.cpp
-  src/app_shell/diagnostics.cpp
-  src/app_shell/engine_client.cpp
-  src/app_shell/paths.cpp
-  src/app_shell/tray_icon.cpp
-  src/app_shell/ui_onboarding.cpp
-  src/app_shell/ui_page_layout.cpp
-  src/app_shell/ui_pages.cpp
-  src/app_shell/ui_paint.cpp
-  src/app_shell/ui_theme.cpp
-  src/app_shell/ui_widgets.cpp
-)
-target_include_directories(rayneo_app_ui PUBLIC src)
-target_link_libraries(rayneo_app_ui PUBLIC rayneo_app_model rayneo_core rayneo_vdd user32 gdi32 shell32 gdiplus advapi32)
-target_compile_definitions(rayneo_app_ui PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
-
-# Offscreen render of the real controller UI into PNGs (no window, no
-# hardware): layout sanity checks under ctest, screenshots with --out DIR.
-add_executable(ui_snapshot src/tools/ui_snapshot.cpp)
-target_link_libraries(ui_snapshot PRIVATE rayneo_app_ui)
-add_test(NAME ui_snapshot COMMAND ui_snapshot)
-
-# The controller is a GUI application; spatial_desk.exe stays the renderer engine.
-# The resource script is compiled only when a resource compiler is available
-# (rc.exe inside the MSVC environment), so a toolchain without RC still builds.
-if(WIN32)
-  enable_language(RC OPTIONAL)
-endif()
-
-add_executable(rayneo_spatial_app WIN32
-  src/app_shell/main.cpp
-)
-if(WIN32 AND CMAKE_RC_COMPILER)
-  target_sources(rayneo_spatial_app PRIVATE resources/rayneo_spatial.rc)
-  set_source_files_properties(resources/rayneo_spatial.rc PROPERTIES
-    OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/resources/app.manifest;${CMAKE_CURRENT_SOURCE_DIR}/resources/app.ico"
-  )
-endif()
-set_target_properties(rayneo_spatial_app PROPERTIES
-  OUTPUT_NAME "RayNeo Spatial"
-  WIN32_EXECUTABLE TRUE
-)
-# The .rc already embeds the application manifest (ID 1); suppress the
-# linker's auto-generated manifest to avoid a CVT1100 duplicate resource.
-target_link_options(rayneo_spatial_app PRIVATE "/MANIFEST:NO")
-target_link_libraries(rayneo_spatial_app PRIVATE rayneo_app_ui)
-# On the resource compiler's include path so the manifest resolves from the
-# source tree rather than from the build directory.
-target_include_directories(rayneo_spatial_app PRIVATE resources)
-
 add_executable(camera_selftest
   src/tools/camera_selftest.cpp
   src/render/camera.cpp
 )
-target_link_libraries(camera_selftest PRIVATE rayneo_core)
+target_link_libraries(camera_selftest PRIVATE rayneo_core rayneo_directxmath)
 add_test(NAME camera_selftest COMMAND camera_selftest)
 
 add_executable(pose_selftest src/tools/pose_selftest.cpp)
@@ -171,6 +115,8 @@ add_test(NAME orientation_calibration_selftest COMMAND orientation_calibration_s
 
 add_executable(orientation_calibrate src/tools/orientation_calibrate.cpp)
 target_link_libraries(orientation_calibrate PRIVATE rayneo_core)
+# The selftest runs the tool beside itself (non-ASCII argument check).
+add_dependencies(orientation_calibration_selftest orientation_calibrate)
 
 add_executable(protocol_selftest src/tools/protocol_selftest.cpp)
 target_link_libraries(protocol_selftest PRIVATE rayneo_core)
@@ -180,20 +126,128 @@ add_executable(layout_selftest src/tools/layout_selftest.cpp)
 target_link_libraries(layout_selftest PRIVATE rayneo_layout)
 add_test(NAME layout_selftest COMMAND layout_selftest)
 
-add_executable(vdd_selftest src/tools/vdd_selftest.cpp)
-target_link_libraries(vdd_selftest PRIVATE rayneo_vdd)
-add_test(NAME vdd_selftest COMMAND vdd_selftest)
-
-add_executable(capture_smoketest src/tools/capture_smoketest.cpp)
-target_link_libraries(capture_smoketest PRIVATE rayneo_capture)
-
 add_executable(view_selftest
   src/tools/view_selftest.cpp
   src/render/camera.cpp
 )
-target_link_libraries(view_selftest PRIVATE rayneo_core rayneo_layout)
+target_link_libraries(view_selftest PRIVATE rayneo_core rayneo_layout rayneo_directxmath)
 add_test(NAME view_selftest COMMAND view_selftest "${CMAKE_SOURCE_DIR}/scratch")
 
-add_executable(app_selftest src/tools/app_selftest.cpp)
-target_link_libraries(app_selftest PRIVATE rayneo_app_model)
-add_test(NAME app_selftest COMMAND app_selftest)
+# ---------------------------------------------------------------------------
+# Windows platform: virtual displays (Parsec VDD), Desktop Duplication,
+# the D3D11 engine and the Win32 controller.
+# ---------------------------------------------------------------------------
+if(WIN32)
+  add_library(rayneo_vdd STATIC
+    src/vdd/display_config.cpp
+    src/vdd/display_scale.cpp
+    src/vdd/vdd_client.cpp
+    src/vdd/workspace_reload.cpp
+  )
+  target_include_directories(rayneo_vdd PUBLIC src)
+  target_link_libraries(rayneo_vdd PUBLIC setupapi cfgmgr32)
+
+  add_library(rayneo_capture STATIC
+    src/capture/desktop_duplication.cpp
+  )
+  target_include_directories(rayneo_capture PUBLIC src)
+  target_link_libraries(rayneo_capture PUBLIC d3d11 dxgi)
+
+  add_executable(spatial_desk
+    src/app/spatial_desk.cpp
+    src/app/engine_protocol.cpp
+    src/app/view_comfort.cpp
+    src/imu/imu_source.cpp
+    src/render/camera.cpp
+    src/render/renderer.cpp
+  )
+  target_link_libraries(spatial_desk PRIVATE rayneo_core rayneo_layout rayneo_vdd rayneo_capture d3d11 dxgi d3dcompiler user32 gdi32)
+
+  # Controller application model: no windows, covered by app_selftest.
+  # It owns the preference file, the layout editing rules, the engine command
+  # contract, the telemetry tail reader and the per-session log archive.
+  # (Linux: phase 4 of docs/linux/PORTING.md; app_config.cpp and
+  # session_logs.cpp still use Win32.)
+  add_library(rayneo_app_model STATIC
+    src/app/engine_protocol.cpp
+    src/app/view_comfort.cpp
+    src/app_shell/app_config.cpp
+    src/app_shell/app_layout.cpp
+    src/app_shell/calibration_progress.cpp
+    src/app_shell/calibration_guide.cpp
+    src/app_shell/engine_commands.cpp
+    src/app_shell/onboarding.cpp
+    src/app_shell/session_logs.cpp
+    src/app_shell/telemetry.cpp
+    src/app_shell/ui_anim.cpp
+    src/app_shell/ui_model.cpp
+  )
+  target_include_directories(rayneo_app_model PUBLIC src)
+  target_link_libraries(rayneo_app_model PUBLIC nlohmann_json::nlohmann_json rayneo_layout)
+
+  # Controller shell: Win32 window, tray lifecycle, engine process owner and the
+  # read-only health checks. Inbox Windows libraries only.
+  add_library(rayneo_app_ui STATIC
+    src/app_shell/app_state.cpp
+    src/app_shell/app_window.cpp
+    src/app_shell/calibration_runner.cpp
+    src/app_shell/cal_guide_window.cpp
+    src/app_shell/ui_cal_guide.cpp
+    src/app_shell/diagnostics.cpp
+    src/app_shell/engine_client.cpp
+    src/app_shell/paths.cpp
+    src/app_shell/tray_icon.cpp
+    src/app_shell/ui_onboarding.cpp
+    src/app_shell/ui_page_layout.cpp
+    src/app_shell/ui_pages.cpp
+    src/app_shell/ui_paint.cpp
+    src/app_shell/ui_theme.cpp
+    src/app_shell/ui_widgets.cpp
+  )
+  target_include_directories(rayneo_app_ui PUBLIC src)
+  target_link_libraries(rayneo_app_ui PUBLIC rayneo_app_model rayneo_core rayneo_vdd user32 gdi32 shell32 gdiplus advapi32)
+  target_compile_definitions(rayneo_app_ui PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+
+  # Offscreen render of the real controller UI into PNGs (no window, no
+  # hardware): layout sanity checks under ctest, screenshots with --out DIR.
+  add_executable(ui_snapshot src/tools/ui_snapshot.cpp)
+  target_link_libraries(ui_snapshot PRIVATE rayneo_app_ui)
+  add_test(NAME ui_snapshot COMMAND ui_snapshot)
+
+  # The controller is a GUI application; spatial_desk.exe stays the renderer engine.
+  # The resource script is compiled only when a resource compiler is available
+  # (rc.exe inside the MSVC environment), so a toolchain without RC still builds.
+  enable_language(RC OPTIONAL)
+
+  add_executable(rayneo_spatial_app WIN32
+    src/app_shell/main.cpp
+  )
+  if(CMAKE_RC_COMPILER)
+    target_sources(rayneo_spatial_app PRIVATE resources/rayneo_spatial.rc)
+    set_source_files_properties(resources/rayneo_spatial.rc PROPERTIES
+      OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/resources/app.manifest;${CMAKE_CURRENT_SOURCE_DIR}/resources/app.ico"
+    )
+  endif()
+  set_target_properties(rayneo_spatial_app PROPERTIES
+    OUTPUT_NAME "RayNeo Spatial"
+    WIN32_EXECUTABLE TRUE
+  )
+  # The .rc already embeds the application manifest (ID 1); suppress the
+  # linker's auto-generated manifest to avoid a CVT1100 duplicate resource.
+  target_link_options(rayneo_spatial_app PRIVATE "/MANIFEST:NO")
+  target_link_libraries(rayneo_spatial_app PRIVATE rayneo_app_ui)
+  # On the resource compiler's include path so the manifest resolves from the
+  # source tree rather than from the build directory.
+  target_include_directories(rayneo_spatial_app PRIVATE resources)
+
+  add_executable(vdd_selftest src/tools/vdd_selftest.cpp)
+  target_link_libraries(vdd_selftest PRIVATE rayneo_vdd)
+  add_test(NAME vdd_selftest COMMAND vdd_selftest)
+
+  add_executable(capture_smoketest src/tools/capture_smoketest.cpp)
+  target_link_libraries(capture_smoketest PRIVATE rayneo_capture)
+
+  add_executable(app_selftest src/tools/app_selftest.cpp)
+  target_link_libraries(app_selftest PRIVATE rayneo_app_model)
+  add_test(NAME app_selftest COMMAND app_selftest)
+endif()

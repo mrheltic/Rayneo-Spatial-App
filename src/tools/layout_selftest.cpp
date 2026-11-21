@@ -7,7 +7,12 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#ifdef _WIN32
 #include <process.h>
+#else
+#include <unistd.h>
+#define _getpid getpid  // per-process temp names (bug 29)
+#endif
 #include <string>
 
 namespace {

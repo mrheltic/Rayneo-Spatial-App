@@ -1,0 +1,18 @@
+RayNeo Spatial Workspace
+Copyright the original author, AkshayReddyGujjula
+https://github.com/AkshayReddyGujjula/Rayneo-Spatial-App
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This repository is a fork that adds a Linux port. Files changed for the port
+are listed in the git history of the `linux-port` branch; the main changes are:
+- CMakeLists.txt / CMakePresets.json: portable core split from the Windows
+  targets, Linux presets, DirectXMath fetched for non-Windows builds.
+- POSIX code paths in src/tools/orientation_calibrate.cpp and the selftests.
+- New: docs/linux/, packaging/linux/, scripts/linux/, third_party/sal/,
+  and the Linux platform code under src/platform/linux/ and src/app_linux/.
+
+Third-party components fetched or used at build time:
+- DirectXMath (MIT License), https://github.com/microsoft/DirectXMath
+- hidapi (BSD/GPLv3/original HIDAPI license, distribution package)
+- nlohmann/json (MIT License, distribution package)
