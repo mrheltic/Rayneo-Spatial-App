@@ -13,7 +13,7 @@ code goes in new folders (`src/platform/linux/`, `src/app_linux/`); shared files
 | Phase | Scope | State |
 |---|---|---|
 | 0 | Fork, remotes, dev environment script, udev rule, these docs | done (fork on GitHub: see below) |
-| 1 | Portable core builds and tests on Linux (gcc + clang), numeric baseline | builds warning-free with both compilers; 7/8 suites pass, `pose_scenarios` scenario 10 fails as documented for g++ (see `BASELINE.md`); hypothesis test and replay pending |
+| 1 | Portable core builds and tests on Linux (gcc + clang), numeric baseline | done: warning-free with both compilers, 7/8 suites pass; scenario 10 fails because the simulated bias leaves the band it tests (`BASELINE.md`, upstream issue #1); real-data replay pending |
 | 2 | Glasses on Linux (hidraw IMU, glasses output) + engine with test screens (Wayland, EGL/GLES 3) | not started |
 | 3 | Virtual monitors (evdi) + capture | not started |
 | 4 | Qt 6 controller over the existing app model | not started |

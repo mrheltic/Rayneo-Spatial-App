@@ -1,9 +1,7 @@
 # Linux numeric baseline
 
-Status: **preliminary** (2026-11-21). First Linux run of the portable suites, before the
-distribution packages were installed (built against the installed hidapi-hidraw runtime and
-temporary headers; the code under test is identical). Re-run after `scripts/linux/setup-dev.sh`
-and replace this note.
+Status: 2026-11-21. Re-run with the distribution packages installed (`setup-dev.sh`): same
+results as the first, pre-install run, value for value.
 
 Machine: Ubuntu 26.04, x86-64, GCC 15.2.0 and Clang 21.1.8, libstdc++, glibc, RelWithDebInfo.
 
@@ -33,15 +31,44 @@ New evidence: GCC and Clang print **identical** `pose_scenarios` output, every v
 digit. Two different compilers giving the same result points away from code generation and
 towards the **standard library**: both use libstdc++ and glibc here, MSVC uses its own STL and CRT.
 
-Main suspect: the synthetic IMU noise. `HeadSim` (`src/tools/pose_scenarios.cpp`) draws from
-`std::mt19937` (sequence fixed by the standard) through `std::normal_distribution<float>`, whose
-algorithm is **implementation-defined**. libstdc++ and MSVC therefore feed the estimator
-*different noise sequences* from the same seed. Every scenario sees a different noise
-realisation, not only scenario 10. Scenario 10 is the one that sits near a tipping point (a
-1.5 deg/s bias at the clamp, 10 minutes of escape/rollback decisions).
+Noise is one factor. `HeadSim` (`src/tools/pose_scenarios.cpp`) draws from `std::mt19937`
+(sequence fixed by the standard) through `std::normal_distribution<float>`, whose algorithm is
+**implementation-defined**, so libstdc++ and MSVC feed the estimator different noise from the same
+seed. libm (`atan2`, `exp`, `sin`) is a smaller second source: the noiseless scenario 17 still
+differs (+/-0.0174 here, +/-0.025 on MSVC). But swapping in a portable generator (Box-Muller on raw
+`mt19937` words) only moves scenario 10 from 90.69 to 58.6 deg. It still fails.
 
-libm (`atan2`, `exp`, `sin`) is a second, smaller source: the noiseless scenario 17 still differs
-(+/-0.0174 here, +/-0.025 on MSVC).
+### Scenario 10 is seed-dependent, and the simulator leaves the band it tests
+
+Reproduce: `scripts/linux/scenario10_experiment.py` (instrumented copy in a temp dir; the repo is
+not modified). 40 seeds per row, GCC, RelWithDebInfo flags:
+
+| Variant | min | median | max | mean | fails (>= 40) | fails with final true \|bias\| > 1.5 |
+|---|---:|---:|---:|---:|---:|---:|
+| std noise, bias random walk on (as shipped) | 0.06 | 27.03 | 196.90 | 41.47 | 14 | 13 of 14 |
+| portable noise, walk on | 0.04 | 43.90 | 185.33 | 58.84 | 21 | 20 of 21 |
+| std noise, walk off | 0.01 | 0.63 | 32.18 | 6.92 | 0 | (true bias stays 1.5 +/- 0.02) |
+| portable noise, walk off | 0.04 | 6.61 | 49.07 | 10.67 | 2 | (true bias stays 1.5 +/- 0.02) |
+
+Findings:
+
+1. **The shipped seed's result is one draw from a wide distribution.** As shipped, scenario 10 ranges
+   from 0.06 to 197 deg across seeds and fails on 35% of them under libstdc++. MSVC's 29.2 deg passes
+   on its own noise; it does not show the behaviour is bounded.
+2. **The main cause is the scenario, not Linux and not the estimator's FP path.** The true bias starts
+   at exactly the band limit (1.5 deg/s) and the simulator's per-sample random walk
+   (`bias_walk_degs = 5e-4`, about 0.27 deg/s rms per axis over 10 min) carries it outside the band in
+   more than half the seeds. AGENTS.md section 4 says a bias above 1.5 deg/s cannot be corrected and
+   shows as creep. That is what these runs show. Default seed: final true |bias| 1.92 deg/s, drift
+   accelerating over the last minutes (-0.3 0.2 1.1 3.1 3.9 6.4 15.5 31.3 60.1 90.7 deg).
+   With the walk off the same seed gives 0.12 deg.
+3. **A smaller residual remains.** A bias held at exactly the clamp still spreads its outcome
+   (up to 49 deg with portable noise, 2 of 40 over the limit). The estimator sits on the clamp edge
+   there. That is a robustness question for the estimator owner, not a port issue.
+
+Not changed: the scenario, its limit, the estimator. Fixing scenario 10 (e.g. no walk, or a walk
+reflected inside the band, plus a seed sweep instead of one seed) changes the MSVC contract too,
+so it goes to upstream (issue #1) rather than being made unilaterally here.
 
 ## Comparison with the MSVC tables (AGENTS.md section 5)
 
@@ -71,13 +98,9 @@ well inside its bound). Scenario 16 is the next one to watch.
 
 ## Next steps (phase 1)
 
-1. Test the hypothesis: give `HeadSim` a portable normal generator (Box-Muller on raw `mt19937`
-   output, which the standard fixes) behind a test-only switch. Then run MSVC and Linux on the
-   *same* noise. If scenario 10 still diverges, the cause is libm or the estimator's FP path, and
-   it needs a closer look before any Linux numbers count as a contract.
-2. Run scenario 10 over several seeds on both platforms. A runaway on some seeds would be an
-   estimator robustness finding in its own right, not a Linux quirk.
-3. Replay real data (`imu_replay --stats`, `--startup-audit`). Real data uses no
+1. Agree a scenario 10 fix with upstream (see above). Until then, `pose_scenarios` on Linux is
+   expected to fail scenario 10 only; any other failure is a regression.
+2. Replay real data (`imu_replay --stats`, `--startup-audit`). Real data uses no
    `normal_distribution`, so this is the cleanest check that the Linux estimator behaves like the
-   Windows one. The 2026-09-25 recording that AGENTS.md's replay numbers come from is held only by
-   the original author (no upstream release carries it): ask upstream, or record on Linux.
+   Windows one. The 2026-09-25 recording behind AGENTS.md's replay numbers is held only by the
+   original author (requested in issue #1); otherwise record on Linux once the IMU enumerates.
